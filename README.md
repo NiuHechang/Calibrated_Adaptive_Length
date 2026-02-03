@@ -1,11 +1,15 @@
-# Calibrated Adaptive Length (CAL) for Diffusion Language Model Infilling
+# Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly
 
-This repository provides the official implementation of **CAL** (Calibrated Adaptive Length), a training-free framework for autonomous length discovery in Diffusion Language Models (DLMs) for infilling tasks.
+[![arXiv](https://img.shields.io/badge/Paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/2602.00476)
+
+This is the official implementation of the paper **"Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly"**. 
+
+In this work, we propose **CAL** (Calibrated Adaptive Length), a training-free framework that enables Diffusion LMs to approximate optimal infilling lengths. 
 
 ## Repository Structure
 
 - `length_bias.py`: Script for fitting the **Length Bias** function $B(L)$ via double-exponential decay. (See Appendix A).
-- `oracle_peak.py`: Script for visualizing the **Oracle Peak** phenomenon and evaluating calibrated confidence $\Phi_{\text{norm}}(L)$. (See Section 3).
+- `oracle_peak.py`: Script for visualizing the **Oracle Peak** phenomenon and evaluating calibrated confidence $\Phi_{\text{n}}(L)$. (See Section 3).
 - `benchmark/`: Preprocessing scripts for all datasets (HumanEval, ROCStories, CSAbstracts, Yelp).
   - **HumanEval-Infilling** (Code)
   - **ROCStories** (Text)
@@ -48,3 +52,16 @@ def read_problems(benchmark_name: str) -> Dict[str, Dict]:
 ```
 
 The random seeds used in our scripts are identical to those used for the results reported in the paper. Following the preprocessing steps above should yield datasets consistent with our experimental setup.
+
+
+## Citation
+```
+@misc{liu2026diffusionlmsapproximateoptimal,
+      title={Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly}, 
+      author={Hengchang Liu and Zhao Yang and Bing Su},
+      year={2026},
+      eprint={2602.00476},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2602.00476}, 
+}
