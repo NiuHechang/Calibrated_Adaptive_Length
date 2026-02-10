@@ -4,7 +4,7 @@
 
 This is the official implementation of the paper **"Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly"**. 
 
-In this work, we propose **CAL** (Calibrated Adaptive Length), a training-free framework that enables Diffusion LMs to approximate optimal infilling lengths. 
+In this work, we propose **CAL** (Calibrated Adaptive Length), a training-free framework that enables Diffusion LMs to approximate optimal infilling lengths. If you have any questions about the paper, please feel free to open an issue for discussion. 
 
 ## Repository Structure
 
