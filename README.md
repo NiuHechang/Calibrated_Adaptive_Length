@@ -1,67 +1,110 @@
-# Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly
+# Calibrated Adaptive Length (CAL)
 
-[![arXiv](https://img.shields.io/badge/Paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/2602.00476)
+Code for **[Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly](https://arxiv.org/abs/2602.00476)**, NeurIPS 2026.
 
-This is the official implementation of the paper **"Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly"**. 
+CAL uses calibrated first-step confidence to select an infilling length without retraining the model. This release includes the core method and additional experiments; model weights and datasets are not bundled.
 
-In this work, we propose **CAL** (Calibrated Adaptive Length), a training-free framework that enables Diffusion LMs to approximate optimal infilling lengths. If you have any questions about the paper, please feel free to open an issue for discussion. 
+## Setup
 
-## Repository Structure
+Run commands from the repository root. Install PyTorch for your CUDA environment, then:
 
-- `length_bias.py`: Script for fitting the **Length Bias** function $B(L)$ via double-exponential decay. (See Appendix A).
-- `oracle_peak.py`: Script for visualizing the **Oracle Peak** phenomenon and evaluating calibrated confidence $\Phi_{\text{n}}(L)$. (See Section 3).
-- `benchmark/`: Preprocessing scripts for all datasets (HumanEval, ROCStories, CSAbstracts, Yelp).
-  - **HumanEval-Infilling** (Code)
-  - **ROCStories** (Text)
-  - **CSAbstracts** (Text)
-  - **Yelp Reviews** (Text)
-- `llada_cal/`, `diffucoder_cal/`, `dreamcoder_cal/`, `daedal_cal/`: Implementation of the CAL framework and evaluation scripts for respective models.
-
-
-## Benchmark Setup
-
-### 1. ROCStories
-1. Apply for access at the [ROCStories website](https://cs.rochester.edu/nlp/rocstories/).
-2. Upon approval, download the **"ROCStories (full five-sentence stories) winter 2017 set"**.
-3. Place the CSV in `benchmark/ROCstories/` and run `preprocess_roc.py`.
-
-### 2. CSAbstracts
-1. Follow the instructions in the [ILM repository](https://github.com/chrisdonahue/ilm/blob/master/data/get_arxiv_cs_abstracts.sh) to download the dataset.
-2. Place the raw text in `benchmark/CSabstract/` and run `preprocess_abstract.py`.
-
-### 3. Yelp Reviews
-The Yelp dataset is automatically downloaded via the Hugging Face `datasets` library. Simply run `benchmark/Yelp/preprocess_yelp.py`.
-
-### 4. HumanEval-Infilling
-1. Clone and install the official [HumanEval-Infilling](https://github.com/openai/human-eval-infilling) repository.
-2. Use the scripts provided in our `benchmark/humaneval_infilling/` to process the official `.jsonl.gz` files.
-3. This process splits the data into three parts: `Demo` (for bias fitting), `Rest (Single-Line)`, and `Rest (Multi-Line)` (for evaluation).
-4. **Crucial Step:** To enable reading the split datasets, replace the `read_problems` function in `human_eval_infilling/data.py` with the following implementation:
-
-```python
-def read_problems(benchmark_name: str) -> Dict[str, Dict]:
-    benchmark_file = {
-        "demo": os.path.join(ROOT, "HumanEval-SingleLineInfilling-Demo.jsonl.gz"),
-        "single-line": os.path.join(ROOT, "HumanEval-SingleLineInfilling-Rest.jsonl.gz"),
-        "multi-line": os.path.join(ROOT, "HumanEval-MultiLineInfilling-Rest.jsonl.gz"),
-        "random-span": os.path.join(ROOT, "HumanEval-RandomSpanInfilling.jsonl.gz"),
-        "random-span-light": os.path.join(ROOT, "HumanEval-RandomSpanInfillingLight.jsonl.gz"),
-        "test": os.path.join(ROOT, "example_problem.jsonl"),
-    }[benchmark_name]
-    return {task["task_id"]: task for task in stream_jsonl(benchmark_file)}
+```bash
+pip install -r requirements.txt
+pip install git+https://github.com/openai/human-eval-infilling.git
 ```
 
-The random seeds used in our scripts are identical to those used for the results reported in the paper. Following the preprocessing steps above should yield datasets consistent with our experimental setup.
+Models use `trust_remote_code=True`. HumanEval executes generated code: use an isolated environment and follow the upstream [instructions for enabling execution](https://github.com/openai/human-eval-infilling/blob/master/human_eval_infilling/execution.py). Use `--skip_evaluation` for generation only.
 
+## Code infilling
+
+Download the Single-Line and Multi-Line files from [HumanEval-Infilling](https://github.com/openai/human-eval-infilling) into a local `data/` directory. Prepare the calibration and test splits:
+
+```bash
+python benchmark/humaneval_infilling/split_singleline.py \
+  --input data/HumanEval-SingleLineInfilling.jsonl.gz \
+  --demo_output data/HumanEval-SingleLineInfilling-Demo.jsonl.gz \
+  --test_output data/HumanEval-SingleLineInfilling-Rest.jsonl.gz
+python benchmark/humaneval_infilling/extract_multiline.py \
+  --single_demo data/HumanEval-SingleLineInfilling-Demo.jsonl.gz \
+  --multi_input data/HumanEval-MultiLineInfilling.jsonl.gz \
+  --output data/HumanEval-MultiLineInfilling-Rest.jsonl.gz
+```
+
+The split excludes matching infill tasks, not entire functions. Run CAL on LLaDA-Base:
+
+```bash
+python llada_cal/llada_code_infilling.py \
+  --data_file data/HumanEval-SingleLineInfilling-Rest.jsonl.gz \
+  --initial_gen_length 8 --span 1 --dstep 4 --max_gen_length 64 \
+  --use_bias --gpu_ids 0
+```
+
+Use `--dstep -1` for Fixed or `--oracle` for reference-length decoding. Set `--model_name` to change checkpoints. Code decoding defaults to one step per selected token; search adds forwards. Results are saved under `llada_cal/code_results/`.
+
+DiffuCoder, DreamCoder, and DAEDAL entry points are in their respective `*_cal/` folders and also accept `--data_file`. See each script's `--help`.
+
+## Additional experiments
+
+Use the LLaDA code runner above unless noted. Fixed disables search; CAL uses `--use_bias`.
+
+| Experiment | Key settings |
+|---|---|
+| Search vs. more decoding (E1a) | Init32. Fixed-fast: `--steps 16 --dstep -1`; Fixed-full: `--steps 32 --dstep -1`; CAL: `--steps 16 --dstep 4`. Single-Line max64; Multi-Line max128. Approximately matched average total forwards, not per-example compute. |
+| Longer fixed baselines (E1b) | Multi-Line, Base/Instruct, init48/64, max128; Fixed/CAL; omit `--steps`. |
+| Calibration size (E2) | Single-Line, init8; fit n=3/5/10/25/50 with seeds40/41/42, plus n=100. |
+| Confidence scores (E3) | Single-Line, init4/8/16/32; `--search_score margin` or `entropy`, paired with `motivation/bias_margin.json` or `bias_entropy.json` via `--bias_params_file`. |
+| Long spans (E4) | Multi-Line, Base; `--min_ref_length 160 --max_ref_length 240 --initial_gen_length 200 --max_gen_length 256`; Fixed/CAL/reference length; omit `--steps`. |
+
+Collect calibration confidence once, then fit on CPU:
+
+```bash
+python motivation/calibrate_llada.py collect \
+  --data_file data/HumanEval-SingleLineInfilling-Demo.jsonl.gz \
+  --output results/confidence.jsonl
+python motivation/calibrate_llada.py fit \
+  --cache results/confidence.jsonl --n 3 --seed 40 --score top1 \
+  --output results/bias_n3_seed40.json
+```
+
+Pass the fitted file with `--bias_params_file`. E2's n=100 reference uses `motivation/bias_top1_fitted.json` (full precision); the main Top-1 baseline uses the rounded default curve.
+
+## Text and multimodal infilling
+
+Text preprocessing scripts are in `benchmark/`; records contain `prompt`, `suffix`, and `answer`. Obtain [ROCStories](https://cs.rochester.edu/nlp/rocstories/) and set the input path in its preprocessing script; use `sample_size=0` to process all stories.
+
+```bash
+python llada_cal/llada_text_infilling.py \
+  --input_file benchmark/ROCstories/ROCStories_processed.jsonl \
+  --strategy cal --init_len 4 --span 1 --dstep 2 --max_gen_length 16 \
+  --use_bias --gpu_ids 0
+```
+
+Use `--strategy fixed` or `oracle` for controls. Text decoding defaults to the initial length, not the selected length. Main code-to-text experiments reuse the code-fitted bias.
+
+For LaViDa and LLaDA-V, follow [multimodal/README.md](multimodal/README.md). Each model requires its own upstream environment and uses a separate COCO-fitted bias.
+
+The optional `benchmark/ROCstories/llm_judge.py` uses environment-based API credentials and does not show reference answers. This released prompt does not establish how historical judge scores were obtained.
+
+## Tests and license
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests cover CPU logic and interfaces, not GPU reproduction of paper results.
+
+CAL-specific code is licensed under [Apache-2.0](LICENSE). Third-party notices and applicable licenses are retained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Citation
-```
+
+```bibtex
 @misc{liu2026diffusionlmsapproximateoptimal,
-      title={Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly}, 
-      author={Hengchang Liu and Zhao Yang and Bing Su},
-      year={2026},
-      eprint={2602.00476},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2602.00476}, 
+  title={Diffusion LMs Can Approximate Optimal Infilling Lengths Implicitly},
+  author={Hengchang Liu and Zhao Yang and Bing Su},
+  year={2026},
+  eprint={2602.00476},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2602.00476},
 }
+```

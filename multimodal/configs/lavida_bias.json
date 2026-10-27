@@ -1,0 +1,39 @@
+{
+  "model": "lavida",
+  "checkpoint": "jacklishufan/lavida-llada-v1.0-instruct",
+  "checkpoint_revision": "814b2e364e82390f03df451bdf4e81e8ba8eab37",
+  "vision_checkpoint": "google/siglip-so400m-patch14-384",
+  "vision_checkpoint_revision": "9fdffc58afc957d1a03a25b10dba0329ab15c2a3",
+  "instruction": "Provide a one-sentence caption for the provided image.",
+  "examples": 50,
+  "candidate_lengths": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+  ],
+  "exclusion_radius": 1,
+  "fit_pair_count": 650,
+  "bias_formula": "a*exp(-b*L) + c*exp(-d*L) + e",
+  "parameters": {
+    "a": 1.4225537792230107e-12,
+    "b": 1.9997552584177307,
+    "c": 0.40694443953677556,
+    "d": 0.11197602707988923,
+    "e": 0.08238227035264929
+  },
+  "r_squared_on_length_means": 0.9758245324682947,
+  "calibration_sha256": "3aa325e3a450097842396a1434d37f87529b978db4ac7507c8047b6aaea55cd5"
+}

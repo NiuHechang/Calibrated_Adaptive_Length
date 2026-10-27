@@ -9,4 +9,6 @@ rouge_score
 pandas
 datasets
 accelerate
-
+bert_score
+evaluate
+openai

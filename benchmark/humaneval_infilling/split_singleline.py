@@ -2,6 +2,7 @@ import gzip
 import json
 import random
 import os
+import argparse
 
 """
 Data split utility for HumanEval-SingleLineInfilling.
@@ -52,9 +53,10 @@ def split_dataset(input_path, output_100_path, output_rest_path, sample_size=100
     print("Success.")
 
 if __name__ == "__main__":
-    base_dir = "benchmark/humaneval/human-eval-infilling/data"
-    input_file = os.path.join(base_dir, "HumanEval-SingleLineInfilling.jsonl.gz")
-    output_100 = os.path.join(base_dir, "HumanEval-SingleLineInfilling-Demo.jsonl.gz")
-    output_rest = os.path.join(base_dir, "HumanEval-SingleLineInfilling-Rest.jsonl.gz")
-    
-    split_dataset(input_file, output_100, output_rest)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True, help="Upstream SingleLine JSONL.GZ")
+    parser.add_argument("--demo_output", required=True, help="Output calibration JSONL.GZ")
+    parser.add_argument("--test_output", required=True, help="Output Rest JSONL.GZ")
+    parser.add_argument("--sample_size", type=int, default=100)
+    args = parser.parse_args()
+    split_dataset(args.input, args.demo_output, args.test_output, args.sample_size)

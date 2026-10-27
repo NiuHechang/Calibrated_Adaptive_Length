@@ -1,3 +1,6 @@
+# Adapted from Li-Jinsong/DAEDAL (Apache-2.0) for prefix/suffix infilling.
+# LLaDA-derived sampling portions: Copyright (c) 2025 NieShenRuc (MIT).
+# See LICENSE and LICENSES/LLaDA-MIT.txt.
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel

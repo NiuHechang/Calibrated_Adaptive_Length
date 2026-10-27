@@ -1,7 +1,12 @@
+# Adapted from ML-GSAI/LLaDA sampling code (MIT).
+# Original copyright: Copyright (c) 2025 NieShenRuc.
+# See LICENSES/LLaDA-MIT.txt. CAL adds infilling, calibrated search, and score choices.
+import json
+import math
+import time
 import torch
 import numpy as np
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
 
 """
 CAL (Calibrated Adaptive Length) framework adapted for LLaDA.
@@ -50,14 +55,42 @@ def get_bias(l):
     a, b, c, d, e = 1.00, 1.77, 0.56, 0.06, 0.24
     return a * np.exp(-b * l) + c * np.exp(-d * l) + e
 
+
+def load_bias_params(path):
+    """Read the published code/E2/E3 or legacy ROCStories parameter JSON."""
+    with open(path, encoding="utf-8") as source:
+        payload = json.load(source)
+    parameters = payload.get("double_exp", payload)
+    return [parameters[name] for name in ("a", "b", "c", "d", "e")]
+
+
+def get_search_confidence(logits, search_score="top1"):
+    """Per-position confidence used only by the length-probing stage."""
+    if search_score == "top1":
+        probs = F.softmax(logits, dim=-1)
+        tokens = logits.argmax(dim=-1, keepdim=True)
+        return probs.gather(-1, tokens).squeeze(-1)
+    if search_score == "margin":
+        top2 = F.softmax(logits, dim=-1).topk(2, dim=-1).values
+        return top2[..., 0] - top2[..., 1]
+    if search_score == "entropy":
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+        return 1.0 - entropy / math.log(logits.shape[-1])
+    raise ValueError(search_score)
+
 @ torch.no_grad()
 def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_attention_mask=None, steps=None, gen_length=8, block_length=None, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False, confidence_eos_eot_inf=False,
-             span=1, max_gen_length=64, dstep=4, use_bias=True):
+             span=1, max_gen_length=64, dstep=4, use_bias=True,
+             bias_params=None, search_score="top1"):
     """
     Adaptive length generation for LLaDA using CAL.
-    Stage 1: Discover optimal infilling length via calibrated confidence.
+    Stage 1: Select an infilling length via calibrated confidence.
     Stage 2: Standard iterative denoising with the discovered length.
+    A single block covers the selected span; block_length is retained only
+    for compatibility with older callers. steps=None uses the selected length.
+    Returns (tokens, search_forwards, search_seconds, decode_seconds).
     """
     prefix_len = prefix_ids.shape[1]
     suffix_len = suffix_ids.shape[1] if suffix_ids is not None else 0
@@ -65,8 +98,12 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
     # --- Stage 1: Length Discovery (Probing) ---
     best_len = gen_length
     search_steps = 0
+    t_search = 0.0
     
     if dstep >= 0:
+        if prefix_ids.is_cuda:
+            torch.cuda.synchronize(prefix_ids.device)
+        start_search = time.perf_counter()
         def get_conf_at_len(l):
             nonlocal search_steps
             search_steps += 1
@@ -89,7 +126,6 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
                 curr_att = None
 
             p_idx = (x_t != mask_id)
-            m_idx = (x_t == mask_id)
 
             if cfg_scale > 0.:
                 un_x = x_t.clone(); un_x[p_idx] = mask_id
@@ -102,16 +138,17 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
                 logits = model(x_t, attention_mask=curr_att).logits
 
             if logits_eos_inf: logits[:, :, 126081] = -torch.inf
-            p = F.softmax(logits, dim=-1)
-            x0_t = torch.argmax(logits, dim=-1)
-            x0_p_t = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0_t, -1)), -1)
-            
-            # Raw Phi(L)
-            curr_conf = get_masked_avg_conf(x0_p_t, m_idx, prefix_len, l).mean().item()
+            curr_conf = get_search_confidence(
+                logits[:, prefix_len:prefix_len + l], search_score
+            ).mean().item()
             
             # Calibration: Phi_norm(L) = Phi(L) / B(L)
             if use_bias:
-                curr_conf /= get_bias(l)
+                if bias_params is None:
+                    curr_conf /= get_bias(l)
+                else:
+                    a, b, c, d, e = bias_params
+                    curr_conf /= a * np.exp(-b * l) + c * np.exp(-d * l) + e
                 
             return curr_conf
 
@@ -145,10 +182,14 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
                 if consecutive_decreases >= dstep: break
             curr_l -= span
 
+        if prefix_ids.is_cuda:
+            torch.cuda.synchronize(prefix_ids.device)
+        t_search = time.perf_counter() - start_search
+
     # --- Stage 2: Formal Decoding ---
     curr_gen_length = best_len
     curr_steps = steps if steps is not None else curr_gen_length
-    curr_block_length = block_length if block_length is not None else curr_gen_length
+    curr_block_length = curr_gen_length
     
     x = torch.full((prefix_ids.shape[0], prefix_len + curr_gen_length + suffix_len), mask_id, dtype=torch.long).to(model.device)
     x[:, :prefix_len] = prefix_ids.clone()
@@ -168,6 +209,10 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
     prompt_index = (x != mask_id)
     num_blocks = curr_gen_length // curr_block_length
     steps_per_block = curr_steps // num_blocks
+
+    if prefix_ids.is_cuda:
+        torch.cuda.synchronize(prefix_ids.device)
+    start_decode = time.perf_counter()
 
     for num_block in range(num_blocks):
         block_start = prefix_len + num_block * curr_block_length
@@ -211,9 +256,13 @@ def generate(model, prefix_ids, suffix_ids=None, attention_mask=None, suffix_att
                 transfer_index[j, select_index] = True
             x[transfer_index] = x0[transfer_index]
 
-    return x, search_steps
+    if prefix_ids.is_cuda:
+        torch.cuda.synchronize(prefix_ids.device)
+    t_decode = time.perf_counter() - start_decode
+    return x, search_steps, t_search, t_decode
 
 if __name__ == '__main__':
+    from transformers import AutoTokenizer, AutoModel
     # --- Execution Logic ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_name = 'GSAI-ML/LLaDA-8B-Instruct'
@@ -232,7 +281,7 @@ if __name__ == '__main__':
     suffix_mask = encoded_suffix['attention_mask'].to(device)
 
     # Execute generation with CAL
-    out, s_steps = generate(model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, attention_mask=prefix_mask, suffix_attention_mask=suffix_mask, 
+    out, s_steps, _, _ = generate(model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, attention_mask=prefix_mask, suffix_attention_mask=suffix_mask,
                    steps=8, gen_length=8, block_length=8, temperature=0., cfg_scale=0., remasking='low_confidence',
                    span=1, max_gen_length=64, dstep=4, use_bias=True)
 

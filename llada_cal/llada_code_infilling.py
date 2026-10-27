@@ -1,189 +1,167 @@
-import os
-import torch
-import subprocess
-import json
+"""HumanEval-Infilling generation and functional evaluation for CAL.
+
+Use --data_file for the prepared Demo/Rest splits. E4 is selected from Multi-Line
+Rest by --min_ref_length 160 --max_ref_length 240. Evaluation executes generated
+Python through the upstream HumanEval checker; run it in an isolated environment.
+"""
+
 import argparse
-import re
+import csv
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
-from datetime import datetime
-from transformers import AutoTokenizer, AutoModel
-from llada_cal import generate
-from benchmark.humaneval.human_eval_infilling.data import write_jsonl, read_problems
 
-"""
-Evaluation script for LLaDA code infilling on HumanEval-Infilling.
-This script supports the CAL framework (length discovery) and standard 
-fixed-length or Oracle-length generation.
-See Section 5.1: Experimental Setup - Code Infilling in the paper.
-"""
+from llada_cal import generate, load_bias_params
 
-def run_on_gpu(rank, gpu_ids, problems_list, num_samples_per_task, output_dir, model_name, 
-    initial_gen_length, steps, block_length, temperature, cfg_scale,
-    span, max_gen_length, dstep, use_oracle, use_bias):
-    """
-    Worker function for parallel inference on a single GPU.
-    """
-    gpu_id = gpu_ids[rank]
-    world_size = len(gpu_ids)
-    device = f'cuda:{gpu_id}'
-    
-    print(f"Process {rank} using GPU {gpu_id}")
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.padding_side != 'left':
-        tokenizer.padding_side = 'left'
 
-    # Partition tasks among processes
-    my_problems = [problems_list[i] for i in range(len(problems_list)) if i % world_size == rank]
-    
+def run_on_gpu(rank, args, problems_list, output_dir):
+    from transformers import AutoModel, AutoTokenizer
+
+    gpu_id = args.gpu_ids[rank]
+    device = f"cuda:{gpu_id}"
+    model = AutoModel.from_pretrained(
+        args.model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    bias_params = load_bias_params(args.bias_params_file) if args.bias_params_file else None
     samples = []
-    for i in range(num_samples_per_task):
-        pbar = tqdm(my_problems, desc=f"Sample {i+1}/{num_samples_per_task}", disable=(rank != 0))
-        for problem in pbar:
-            task_id = problem["task_id"]
-            prefix = problem["prompt"]
-            suffix = problem["suffix"]
+    for problem in tqdm(problems_list[rank::len(args.gpu_ids)], desc=f"GPU {gpu_id}"):
+        prefix = tokenizer(problem["prompt"], add_special_tokens=False, return_tensors="pt").to(device)
+        suffix = tokenizer(problem["suffix"], add_special_tokens=False, return_tensors="pt").to(device)
+        true_len = len(tokenizer.encode(problem["canonical_solution"], add_special_tokens=False))
+        initial_length = true_len if args.oracle else args.initial_gen_length
+        output, search_steps, search_seconds, decode_seconds = generate(
+            model, prefix_ids=prefix["input_ids"], suffix_ids=suffix["input_ids"],
+            attention_mask=prefix["attention_mask"], suffix_attention_mask=suffix["attention_mask"],
+            steps=args.steps, gen_length=initial_length, block_length=args.block_length,
+            temperature=args.temp, cfg_scale=args.cfg_scale, span=args.span,
+            max_gen_length=args.max_gen_length, dstep=-1 if args.oracle else args.dstep,
+            use_bias=args.use_bias, bias_params=bias_params, search_score=args.search_score,
+        )
+        middle = output[0, prefix["input_ids"].shape[1]:output.shape[1] - suffix["input_ids"].shape[1]]
+        selected_length = len(middle)
+        decode_steps = selected_length if args.steps is None else args.steps
+        samples.append({
+            "task_id": problem["task_id"],
+            "completion": tokenizer.decode(middle, skip_special_tokens=True),
+            "gen_len": selected_length,
+            "actual_gen_len": selected_length,
+            "true_len": true_len,
+            "len_error": abs(selected_length - true_len),
+            "search_steps": search_steps,
+            "decode_steps": decode_steps,
+            "total_forwards": search_steps + decode_steps,
+            "wall_search": search_seconds,
+            "wall_decode": decode_seconds,
+            "wall_total": search_seconds + decode_seconds,
+        })
+    with open(Path(output_dir) / f"shard_{rank}.jsonl", "w", encoding="utf-8") as target:
+        for sample in samples:
+            target.write(json.dumps(sample) + "\n")
 
-            encoded_prefix = tokenizer(prefix, add_special_tokens=False, padding=True, return_tensors="pt")
-            encoded_suffix = tokenizer(suffix, add_special_tokens=False, padding=True, return_tensors="pt")
 
-            prefix_ids = encoded_prefix['input_ids'].to(device)
-            prefix_mask = encoded_prefix['attention_mask'].to(device)
-            suffix_ids = encoded_suffix['input_ids'].to(device)
-            suffix_mask = encoded_suffix['attention_mask'].to(device)
-            
-            # Length configuration logic
-            curr_gen_len = initial_gen_length
-            curr_dstep = dstep
-            if use_oracle:
-                gt_solution = problem.get("canonical_solution", "")
-                if gt_solution:
-                    encoded_gt = tokenizer(gt_solution, add_special_tokens=False)
-                    curr_gen_len = len(encoded_gt['input_ids'])
-                    curr_dstep = -1 # Disable search if Oracle length is provided
-                else:
-                    print(f"Warning: No canonical_solution for {task_id}, using default.")
+def evaluate_samples(problems, samples, timeout, n_workers):
+    from human_eval_infilling.execution import check_correctness
 
-            # Perform generation using CAL framework
-            out, s_steps = generate(model, prefix=prefix_ids, suffix=suffix_ids, 
-                           attention_mask=prefix_mask, suffix_attention_mask=suffix_mask,
-                           steps=steps if steps is not None else curr_gen_len,
-                           gen_length=curr_gen_len,
-                           block_length=block_length if block_length is not None else curr_gen_len,
-                           temperature=temperature, 
-                           cfg_scale=cfg_scale,
-                           span=span,
-                           max_gen_length=max_gen_length,
-                           dstep=curr_dstep,
-                           use_bias=use_bias)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            pool.submit(check_correctness, problems[sample["task_id"]], sample["completion"], timeout, 0)
+            for sample in samples
+        ]
+        for sample, future in zip(samples, futures):
+            result = future.result()
+            sample["passed"] = result["passed"]
+            sample["result"] = result["result"]
+    return sum(sample["passed"] for sample in samples) / len(samples)
 
-            # Extract the generated middle segment
-            o = out[0]
-            prefix_len = prefix_ids.shape[1]
-            suffix_len = suffix_ids.shape[1]
-            middle_part = o[prefix_len : len(o) - suffix_len]
-            completion = tokenizer.decode(middle_part, skip_special_tokens=True)
 
-            samples.append(dict(
-                task_id=task_id, 
-                completion=completion,
-                gen_len=len(middle_part),
-                actual_gen_len=len(middle_part),
-                search_steps=s_steps
-            ))
-
-    # Save shard results
-    os.makedirs(output_dir, exist_ok=True)
-    write_jsonl(os.path.join(output_dir, f"shard_gpu_{gpu_id}.jsonl"), samples)
-
-if __name__ == "__main__":
-    # --- Multi-processing configuration ---
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-    # --- Argument Parsing ---
-    parser = argparse.ArgumentParser(description="LLaDA CAL Evaluation on HumanEval-Infilling")
-    parser.add_argument("--model_name", type=str, default="GSAI-ML/LLaDA-8B-Base")
-    parser.add_argument("--benchmark_name", type=str, default="single-line")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model_name", default="GSAI-ML/LLaDA-8B-Base")
+    parser.add_argument("--benchmark_name", default="single-line")
+    parser.add_argument("--data_file", help="Prepared HumanEval JSONL or JSONL.GZ; avoids patching upstream data loaders")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=[0])
     parser.add_argument("--initial_gen_length", type=int, default=8)
-    parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--block_length", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None, help="Omit for S=selected length; use 16/32 for E1a")
+    parser.add_argument("--block_length", type=int, default=None, help="Legacy option; CAL decodes one full selected span")
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--cfg_scale", type=float, default=0.0)
-    parser.add_argument("--span", type=int, default=1, help="Search step size (Delta L)")
+    parser.add_argument("--span", type=int, default=1)
     parser.add_argument("--max_gen_length", type=int, default=64)
-    parser.add_argument("--dstep", type=int, default=4, help="Tolerance (D)")
-    parser.add_argument("--oracle", action="store_true", help="Use ground-truth length")
-    parser.add_argument("--use_bias", action="store_true", default=False, help="Enable Length Bias calibration")
+    parser.add_argument("--dstep", type=int, default=4, help="Set -1 to disable length search")
+    parser.add_argument("--oracle", action="store_true")
+    parser.add_argument("--use_bias", action="store_true")
+    parser.add_argument("--bias_params_file")
+    parser.add_argument("--search_score", choices=["top1", "margin", "entropy"], default="top1")
+    parser.add_argument("--min_ref_length", type=int, default=None)
+    parser.add_argument("--max_ref_length", type=int, default=None)
+    parser.add_argument("--output_dir", default="llada_cal/code_results")
+    parser.add_argument("--run_name", default="run")
+    parser.add_argument("--skip_evaluation", action="store_true")
+    parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument("--n_workers", type=int, default=4)
     args = parser.parse_args()
 
-    # --- Setup Output Paths ---
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    output_base = "benchmark/humaneval/generated/llada_cal"
-    output_dir = os.path.join(output_base, "temp_shards")
-    os.makedirs(output_base, exist_ok=True)
-    final_output = os.path.join(output_base, f"{args.benchmark_name}_{timestamp}.jsonl")
-    
-    # --- Load Problems ---
-    raw_problems = read_problems(benchmark_name=args.benchmark_name)
-    problems_list = [raw_problems[tid] for tid in raw_problems]
-    print(f"Starting LLaDA-CAL on {len(args.gpu_ids)} GPUs: {args.gpu_ids}")
-    
-    # --- Run Parallel Inference ---
-    mp.spawn(
-        run_on_gpu,
-        args=(args.gpu_ids, problems_list, 1, output_dir, args.model_name, 
-            args.initial_gen_length, args.steps, args.block_length, args.temp, args.cfg_scale,
-            args.span, args.max_gen_length, args.dstep, args.oracle, args.use_bias),
-        nprocs=len(args.gpu_ids),
-        join=True
-    )
+    from human_eval_infilling.data import read_problems, stream_jsonl, write_jsonl
 
-    # --- Merge Shards ---
-    all_samples = []
-    for gpu_id in args.gpu_ids:
-        part_file = os.path.join(output_dir, f"shard_gpu_{gpu_id}.jsonl")
-        if os.path.exists(part_file):
-            with open(part_file, 'r') as f:
-                for line in f:
-                    all_samples.append(json.loads(line))
-            os.remove(part_file)
-    write_jsonl(final_output, all_samples)
-    print(f"Merged results saved to {final_output}")
+    if args.data_file:
+        problems_list = list(stream_jsonl(args.data_file))
+    else:
+        problems_list = list(read_problems(args.benchmark_name).values())
+    if args.min_ref_length is not None or args.max_ref_length is not None:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+        lengths = [len(tokenizer.encode(p["canonical_solution"], add_special_tokens=False)) for p in problems_list]
+        problems_list = [
+            p for p, length in zip(problems_list, lengths)
+            if (args.min_ref_length is None or length >= args.min_ref_length)
+            and (args.max_ref_length is None or length <= args.max_ref_length)
+        ]
 
-    # --- Evaluation ---
-    print(f"Running functional correctness evaluation for {args.benchmark_name}...")
-    pass_at_1 = "N/A"
-    try:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        benchmark_root = os.path.join(project_root, "benchmark", "humaneval")
-        eval_script = os.path.join(benchmark_root, "human_eval_infilling", "evaluate_functional_correctness.py")
-        eval_cmd = f"PYTHONPATH={benchmark_root} python {eval_script} {final_output} --benchmark_name={args.benchmark_name}"
-        eval_output = subprocess.check_output(eval_cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8')
-        match = re.search(r"'pass@1':\s*([\d\.]+)", eval_output)
-        if match:
-            pass_at_1 = f"{float(match.group(1))*100:.2f}%"
-            print(f"Pass@1: {pass_at_1}")
-    except Exception as e:
-        print(f"Evaluation failed: {e}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = Path(args.output_dir) / f"{args.benchmark_name}_{args.run_name}_{timestamp}"
+    run_dir.mkdir(parents=True)
+    with open(run_dir / "config.json", "w", encoding="utf-8") as target:
+        json.dump({**vars(args), "num_examples": len(problems_list)}, target, indent=2)
+    write_jsonl(str(run_dir / "problems.jsonl"), problems_list)
+    mp.set_start_method("spawn", force=True)
+    mp.spawn(run_on_gpu, args=(args, problems_list, str(run_dir)), nprocs=len(args.gpu_ids), join=True)
 
-    # --- Logging Metrics ---
-    total = len(all_samples)
-    avg_len = sum(s.get("gen_len", 0) for s in all_samples) / total if total > 0 else 0
-    avg_ss = sum(s.get("search_steps", 0) for s in all_samples) / total if total > 0 else 0
-    
-    tsv_path = "results_summary.tsv"
-    headers = ["Time", "Model", "Task", "Init_L", "Span", "Max_L", "DStep", "Bias", "Pass@1", "Avg_Len", "Avg_SS"]
-    row = [timestamp, args.model_name, args.benchmark_name, args.initial_gen_length, args.span, 
-           args.max_gen_length, args.dstep, args.use_bias, pass_at_1, f"{avg_len:.1f}", f"{avg_ss:.1f}"]
-    
-    file_exists = os.path.isfile(tsv_path)
-    with open(tsv_path, "a", encoding="utf-8") as f:
-        if not file_exists:
-            f.write("\t".join(headers) + "\n")
-        f.write("\t".join(map(str, row)) + "\n")
-    print(f"Metrics appended to {tsv_path}")
+    samples = []
+    for rank in range(len(args.gpu_ids)):
+        samples.extend(stream_jsonl(str(run_dir / f"shard_{rank}.jsonl")))
+    order = {problem["task_id"]: i for i, problem in enumerate(problems_list)}
+    samples.sort(key=lambda sample: order[sample["task_id"]])
+    write_jsonl(str(run_dir / "samples.jsonl"), samples)
+    pass_at_1 = ""
+    if not args.skip_evaluation:
+        problems = {problem["task_id"]: problem for problem in problems_list}
+        pass_at_1 = 100 * evaluate_samples(problems, samples, args.timeout, args.n_workers)
+        write_jsonl(str(run_dir / "samples_results.jsonl"), samples)
+
+    summary = {
+        "model": args.model_name, "benchmark": args.benchmark_name, "n": len(samples),
+        "initial_length": args.initial_gen_length, "steps_arg": args.steps,
+        "oracle": args.oracle, "dstep": args.dstep, "span": args.span,
+        "search_score": args.search_score, "use_bias": args.use_bias,
+        "bias_params_file": args.bias_params_file, "pass_at_1": pass_at_1,
+    }
+    for field in ("gen_len", "len_error", "search_steps", "decode_steps", "total_forwards",
+                  "wall_search", "wall_decode", "wall_total"):
+        summary[f"avg_{field}"] = sum(sample[field] for sample in samples) / len(samples)
+    with open(run_dir / "summary.tsv", "w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=list(summary), delimiter="\t")
+        writer.writeheader()
+        writer.writerow(summary)
+    print(json.dumps(summary, indent=2))
+    print(f"Results: {run_dir}")
+
+
+if __name__ == "__main__":
+    main()

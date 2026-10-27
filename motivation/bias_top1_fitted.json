@@ -1,0 +1,16 @@
+{
+  "double_exp": {
+    "a": 0.9999999999999994,
+    "b": 1.765692025531764,
+    "c": 0.563876293128722,
+    "d": 0.05585616709165177,
+    "e": 0.23874519449687964,
+    "r2": 0.9955421690684979
+  },
+  "calibration": {
+    "score": "top1",
+    "size": 100,
+    "num_forwards": 944
+  },
+  "note": "Full-precision fit. The main top-1 experiments instead use rounded defaults in llada_cal.py."
+}

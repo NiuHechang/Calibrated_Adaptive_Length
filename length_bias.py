@@ -4,13 +4,14 @@ This script implements the double-exponential fitting used to decouple
 length bias from semantic signals. (See Appendix A of the paper).
 """
 
+import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import curve_fit
 from transformers import AutoTokenizer, AutoModel
-from benchmark.humaneval.human_eval_infilling.data import read_problems
+from human_eval_infilling.data import stream_jsonl
 
 # Import shared confidence calculation function
 from oracle_peak import get_conf_at_len
@@ -24,13 +25,17 @@ def bias_func(L, a, b, c, d, e):
     return a * np.exp(-b * L) + c * np.exp(-d * L) + e
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_file", default="data/HumanEval-SingleLineInfilling-Demo.jsonl.gz")
+    args = parser.parse_args()
+
     # Use general device configuration
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_name = 'GSAI-ML/LLaDA-8B-Base'
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
-    problems = read_problems("demo")
+    problems = {p["task_id"]: p for p in stream_jsonl(args.data_file)}
     test_lengths = [1, 2, 4, 6, 12, 16, 24, 32, 48, 64, 96, 128]
     
     all_data_points = []

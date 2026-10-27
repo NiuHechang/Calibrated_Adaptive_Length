@@ -6,7 +6,7 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
-from llada_cal import generate
+from llada_cal import generate, load_bias_params
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 import pandas as pd
@@ -44,6 +44,7 @@ def run_on_gpu(rank, args, problems_list, output_dir):
     print(f"Process {rank} starting on GPU {gpu_id}...")
     model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    bias_params = load_bias_params(args.bias_params_file) if args.bias_params_file else None
     if tokenizer.padding_side != 'left':
         tokenizer.padding_side = 'left'
 
@@ -77,17 +78,19 @@ def run_on_gpu(rank, args, problems_list, output_dir):
             curr_dstep = -1 
         else:
             gen_length = args.init_len
-            curr_dstep = args.dstep
+            curr_dstep = -1 if args.strategy == "fixed" else args.dstep
             
         if gen_length <= 0: continue
 
         # Perform generation using CAL framework
-        out, s_steps = generate(model, prefix=prefix_ids, suffix=suffix_ids, 
+        decode_steps = gen_length if args.steps is None else args.steps
+        out, s_steps, search_seconds, decode_seconds = generate(model, prefix_ids=prefix_ids, suffix_ids=suffix_ids,
                      attention_mask=encoded_prefix['attention_mask'].to(device), 
                      suffix_attention_mask=encoded_suffix['attention_mask'].to(device), 
-                     steps=gen_length, gen_length=gen_length, 
+                     steps=decode_steps, gen_length=gen_length,
                      temperature=0., cfg_scale=0., remasking='low_confidence',
-                     span=args.span, max_gen_length=args.max_gen_length, dstep=curr_dstep, use_bias=args.use_bias)
+                     span=args.span, max_gen_length=args.max_gen_length, dstep=curr_dstep,
+                     use_bias=args.use_bias, bias_params=bias_params, search_score=args.search_score)
 
         # Extract the generated middle segment
         generated_ids = out[0, prefix_ids.shape[1] : out.shape[1] - suffix_ids.shape[1]]
@@ -98,10 +101,15 @@ def run_on_gpu(rank, args, problems_list, output_dir):
 
         results.append({
             "storyid": story_id,
+            "prefix": prompt,
+            "suffix": suffix,
             "bleu2": bleu2,
             "rougeL": rougeL,
             "actual_gen_len": len(generated_ids),
             "search_steps": s_steps,
+            "decode_steps": decode_steps,
+            "wall_search": search_seconds,
+            "wall_decode": decode_seconds,
             "prediction": completion.replace('\n', ' '),
             "ground_truth": answer.replace('\n', ' ')
         })
@@ -114,10 +122,7 @@ def run_on_gpu(rank, args, problems_list, output_dir):
 
 if __name__ == "__main__":
     # --- Multi-processing configuration ---
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
+    mp.set_start_method('spawn', force=True)
 
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="LLaDA Unified Text Infilling Evaluation")
@@ -125,19 +130,30 @@ if __name__ == "__main__":
     parser.add_argument("--input_file", type=str, required=True, 
                         help="Path to the processed JSONL file (e.g., benchmark/ROCstories/ROCStories_processed.jsonl)")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=[0, 1])
-    parser.add_argument("--strategy", type=str, choices=["oracle", "fixed"], default="fixed")
+    parser.add_argument("--strategy", type=str, choices=["oracle", "fixed", "cal"], default="fixed")
     parser.add_argument("--init_len", type=int, default=8, help="Initial generation length (Default 8 for Stories/Abstracts, 2 for Yelp)")
     parser.add_argument("--span", type=int, default=1, help="Search step size (Delta L)")
     parser.add_argument("--max_gen_length", type=int, default=16)
     parser.add_argument("--dstep", type=int, default=2, help="Tolerance (D)")
     parser.add_argument("--use_bias", action="store_true", default=False, help="Enable Length Bias calibration")
+    parser.add_argument("--steps", type=int, default=None, help="Default: initial length (not CAL-selected length)")
+    parser.add_argument("--bias_params_file", help="Code/E2/E3 or ROCStories bias JSON")
+    parser.add_argument("--search_score", choices=["top1", "margin", "entropy"], default="top1")
+    parser.add_argument("--output_dir", default="llada_cal/text_result")
     args = parser.parse_args()
     
 
     # --- Setup Output Paths ---
     benchmark_name = os.path.basename(args.input_file).split('_')[0].lower()
-    output_dir = f"method/llada/temp_{benchmark_name}_parts"
-    summary_file = "method/llada/summary_llada_text.tsv"
+    if benchmark_name == "rocstories":
+        benchmark_name = "roc"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_dir = os.path.join(args.output_dir, f"{benchmark_name}_{timestamp}_parts")
+    os.makedirs(output_dir)
+    final_output = os.path.join(args.output_dir, f"{benchmark_name}_results_{timestamp}.jsonl")
+    summary_file = os.path.join(output_dir, "summary.tsv")
+    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as target:
+        json.dump(vars(args), target, indent=2)
     
     if not os.path.exists(args.input_file):
         print(f"Error: {args.input_file} not found.")
@@ -149,7 +165,6 @@ if __name__ == "__main__":
         for line in f:
             problems_list.append(json.loads(line))
             
-    timestamp = datetime.now().strftime("%m%d_%H%M")
     print(f"Total problems: {len(problems_list)}")
     print(f"Benchmark: {benchmark_name}, Strategy: {args.strategy}, Init Len: {args.init_len}, DStep: {args.dstep}")
     
@@ -170,7 +185,11 @@ if __name__ == "__main__":
             with open(part_file, 'r') as f:
                 for line in f:
                     all_results.append(json.loads(line))
-            os.remove(part_file)
+
+    with open(final_output, "w", encoding="utf-8") as target:
+        for result in all_results:
+            target.write(json.dumps(result) + "\n")
+    print(f"Generated infills saved to: {final_output}")
 
     if not all_results:
         print("No results to summarize.")
@@ -184,16 +203,20 @@ if __name__ == "__main__":
     avg_search_steps = df['search_steps'].mean()
     
     # Log summary metrics to TSV
-    headers = ["Time", "Model", "Benchmark", "Init_Len", "Span", "DStep", "UseBias", "Avg_BLEU2", "Avg_RougeL", "Avg_Len", "Avg_SSteps"]
+    headers = ["Time", "Model", "Benchmark", "Strategy", "Init_Len", "StepsArg", "Span", "DStep", "UseBias", "BiasParamsFile", "SearchScore", "Avg_BLEU2", "Avg_RougeL", "Avg_Len", "Avg_SSteps"]
 
     row = {
         "Time": timestamp,
         "Model": args.model_name.split('/')[-1],
         "Benchmark": benchmark_name,
+        "Strategy": args.strategy,
         "Init_Len": args.init_len,
+        "StepsArg": args.steps,
         "Span": args.span,
         "DStep": args.dstep,
         "UseBias": args.use_bias,
+        "BiasParamsFile": args.bias_params_file,
+        "SearchScore": args.search_score,
         "Avg_BLEU2": f"{avg_bleu2:.4f}",
         "Avg_RougeL": f"{avg_rougeL:.4f}",
         "Avg_Len": f"{avg_len:.1f}",

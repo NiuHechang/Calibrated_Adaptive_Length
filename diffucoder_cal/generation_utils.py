@@ -1,4 +1,5 @@
 # coding=utf-8
+# Modified for the CAL release; see THIRD_PARTY_NOTICES.md for provenance.
 # Copyright 2024 The Dream team, HKUNLP Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

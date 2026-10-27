@@ -1,11 +1,11 @@
 import gzip
 import json
 import os
+import argparse
 
 """
-Utility for filtering Multi-line HumanEval tasks to prevent data leakage.
-This script excludes Multi-line tasks whose corresponding Single-line tasks 
-were used in the 'Demo' set for Length Bias fitting.
+Exclude Multi-line tasks matching a Single-line calibration span.
+The split is infill-instance-disjoint, not function-disjoint.
 """
 
 def convert_single_to_multi_id(single_id):
@@ -68,10 +68,9 @@ def filter_multiline_dataset(single_demo_path, multi_input_path, multi_output_pa
     print("Success.")
 
 if __name__ == "__main__":
-    base_dir = "benchmark/humaneval/human-eval-infilling/data"
-    
-    single_demo = os.path.join(base_dir, "HumanEval-SingleLineInfilling-Demo.jsonl.gz")
-    multi_input = os.path.join(base_dir, "HumanEval-MultiLineInfilling.jsonl.gz")
-    multi_output = os.path.join(base_dir, "HumanEval-MultiLineInfilling-Rest.jsonl.gz")
-    
-    filter_multiline_dataset(single_demo, multi_input, multi_output)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--single_demo", required=True)
+    parser.add_argument("--multi_input", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    filter_multiline_dataset(args.single_demo, args.multi_input, args.output)

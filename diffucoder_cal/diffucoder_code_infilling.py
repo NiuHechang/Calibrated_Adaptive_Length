@@ -1,15 +1,14 @@
 import os
 import torch
-import subprocess
 import json
 import argparse
-import re
+from concurrent.futures import ThreadPoolExecutor
 import torch.multiprocessing as mp
 from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
 from diffucoder_cal import generate_fim
-from benchmark.humaneval.human_eval_infilling.data import write_jsonl, read_problems
+from human_eval_infilling.data import write_jsonl, read_problems, stream_jsonl
 
 """
 Evaluation script for DiffuCoder code infilling on HumanEval-Infilling.
@@ -106,17 +105,25 @@ if __name__ == "__main__":
     parser.add_argument("--dstep", type=int, default=4, help="Tolerance (D)")
     parser.add_argument("--oracle", action="store_true", help="Use ground-truth length")
     parser.add_argument("--use_bias", action="store_true", default=False, help="Enable Length Bias calibration")
+    parser.add_argument("--data_file", help="Prepared HumanEval JSONL or JSONL.GZ")
+    parser.add_argument("--output_dir", default="results/diffucoder")
+    parser.add_argument("--skip_evaluation", action="store_true")
+    parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument("--n_workers", type=int, default=4)
     args = parser.parse_args()
 
     # --- Setup Output Paths ---
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    output_base = "benchmark/humaneval/generated/diffucoder_cal"
-    output_dir = os.path.join(output_base, "temp_shards")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_base = args.output_dir
+    output_dir = os.path.join(output_base, f"shards_{timestamp}")
     os.makedirs(output_base, exist_ok=True)
     final_output = os.path.join(output_base, f"{args.benchmark_name}_{timestamp}.jsonl")
     
     # --- Load Problems ---
-    raw_problems = read_problems(benchmark_name=args.benchmark_name)
+    if args.data_file:
+        raw_problems = {p["task_id"]: p for p in stream_jsonl(args.data_file)}
+    else:
+        raw_problems = read_problems(benchmark_name=args.benchmark_name)
     problems_list = [raw_problems[tid] for tid in raw_problems]
     print(f"Starting DiffuCoder-CAL on {len(args.gpu_ids)} GPUs: {args.gpu_ids}")
     
@@ -142,28 +149,31 @@ if __name__ == "__main__":
     write_jsonl(final_output, all_samples)
     print(f"Merged results saved to {final_output}")
 
-    # --- Evaluation ---
-    print(f"Running functional correctness evaluation for {args.benchmark_name}...")
+    # Evaluate exactly the loaded tasks; generated code requires isolation.
     pass_at_1 = "N/A"
-    try:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        benchmark_root = os.path.join(project_root, "benchmark", "humaneval")
-        eval_script = os.path.join(benchmark_root, "human_eval_infilling", "evaluate_functional_correctness.py")
-        eval_cmd = f"PYTHONPATH={benchmark_root} python {eval_script} {final_output} --benchmark_name={args.benchmark_name}"
-        eval_output = subprocess.check_output(eval_cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8')
-        match = re.search(r"'pass@1':\s*([\d\.]+)", eval_output)
-        if match:
-            pass_at_1 = f"{float(match.group(1))*100:.2f}%"
-            print(f"Pass@1: {pass_at_1}")
-    except Exception as e:
-        print(f"Evaluation failed: {e}")
+    if not args.skip_evaluation:
+        from human_eval_infilling.execution import check_correctness
+
+        with ThreadPoolExecutor(max_workers=args.n_workers) as pool:
+            futures = [
+                pool.submit(check_correctness, raw_problems[s["task_id"]],
+                            s["completion"], args.timeout, i)
+                for i, s in enumerate(all_samples)
+            ]
+            for sample, future in zip(all_samples, futures):
+                result = future.result()
+                sample["passed"] = result["passed"]
+                sample["result"] = result["result"]
+        pass_at_1 = f"{100 * sum(s['passed'] for s in all_samples) / len(all_samples):.2f}%"
+        write_jsonl(final_output + "_results.jsonl", all_samples)
+        print(f"Pass@1: {pass_at_1}")
 
     # --- Logging Metrics ---
     total = len(all_samples)
     avg_len = sum(s.get("gen_len", 0) for s in all_samples) / total if total > 0 else 0
     avg_ss = sum(s.get("search_steps", 0) for s in all_samples) / total if total > 0 else 0
     
-    tsv_path = "results_summary_diffucoder.tsv"
+    tsv_path = os.path.join(output_base, "summary.tsv")
     headers = ["Time", "Model", "Task", "Init_L", "Span", "Max_L", "DStep", "Bias", "Pass@1", "Avg_Len", "Avg_SS"]
     row = [timestamp, args.model_name, args.benchmark_name, args.initial_gen_length, args.span, 
            args.max_gen_length, args.dstep, args.use_bias, pass_at_1, f"{avg_len:.1f}", f"{avg_ss:.1f}"]

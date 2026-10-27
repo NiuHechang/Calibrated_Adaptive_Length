@@ -1,9 +1,10 @@
-"""
+r"""
 Implementation of the Oracle Peak analysis for Diffusion Language Models.
-This script evaluates how the first-step denoising confidence $\Phi(L)$ 
+This script evaluates how the first-step denoising confidence $\Phi(L)$
 varies with the infilling length $L$. (See Section 3: Analysis in the paper).
 """
 
+import argparse
 import torch
 import json
 import numpy as np
@@ -12,7 +13,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
-from benchmark.humaneval.human_eval_infilling.data import read_problems
+from human_eval_infilling.data import stream_jsonl
 
 
 def get_bias(l):
@@ -55,6 +56,10 @@ def get_conf_at_len(model, prefix_ids, suffix_ids, l, mask_id=126336):
     return mask_conf
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_file", default="data/HumanEval-SingleLineInfilling-Rest.jsonl.gz")
+    args = parser.parse_args()
+
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -68,7 +73,7 @@ def main():
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
-    problems = read_problems("single-line")
+    problems = {p["task_id"]: p for p in stream_jsonl(args.data_file)}
     results = []
     
     # Scan range: offset from Oracle length L* from -15 to +15
@@ -132,7 +137,7 @@ def main():
 
     fig, ax1 = plt.subplots(figsize=(12, 7))
 
-    ax1.set_xlabel('Offset from Oracle Length ($\Delta L$)', fontweight='bold')
+    ax1.set_xlabel(r'Offset from Oracle Length ($\Delta L$)', fontweight='bold')
     ax1.set_ylabel('Raw Confidence', color='#1f77b4', fontweight='bold')
     ax1.plot(sorted_deltas, avg_raw, marker='o', color='#1f77b4', linewidth=3, markersize=10, 
              label='Raw Confidence (Biased)')

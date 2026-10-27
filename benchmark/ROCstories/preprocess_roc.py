@@ -6,7 +6,7 @@ import os
 """
 Preprocessing script for the ROCStories dataset.
 This script formats five-sentence stories and applies random contiguous 
-masks (2-8 tokens) to create infilling tasks.
+masks (2-8 words) to create infilling tasks.
 See Section 5.1: Experimental Setup - Text Infilling in the paper.
 """
 
@@ -45,7 +45,7 @@ def preprocess_roc(input_file, output_file, sample_size=1000, seed=42):
         full_text = " ".join(sentences)
         words = full_text.split()
         
-        # Random mask length (2-8 tokens)
+        # Random mask length (2-8 words)
         max_possible_len = min(8, len(words))
         mask_len = random.randint(2, max_possible_len) if max_possible_len >= 2 else 1
         # mask_len = random.randint(7, 10)
